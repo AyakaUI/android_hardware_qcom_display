@@ -236,6 +236,18 @@ unsigned long getMetaDataSizeWithReservedRegion(uint64_t reserved_size) {
   return static_cast<unsigned long>(ROUND_UP_PAGESIZE(sizeof(MetaData_t) + reserved_size));
 }
 
+#ifdef METADATA_V2
+// With METADATA_V2, gralloc allocates and maps the metadata buffer as
+// MetaData_t plus the reserved region plus the custom content region
+// (42 KiB for video and camera YUV buffers); see GetMetaDataSize() in
+// gralloc/gr_utils.cpp. Unmapping only sizeof(MetaData_t) + reservedSize
+// leaked the rest of the mapping on every *AndUnmap call.
+static unsigned long handleMetaDataSize(const private_handle_t *handle) {
+    return static_cast<unsigned long>(ROUND_UP_PAGESIZE(
+        sizeof(MetaData_t) + handle->reserved_size + handle->custom_content_md_reserved_size));
+}
+#endif
+
 static int validateAndMap(private_handle_t* handle) {
     if (private_handle_t::validate(handle)) {
         ALOGE("%s: Private handle is invalid - handle:%p", __func__, handle);
@@ -247,6 +259,20 @@ static int validateAndMap(private_handle_t* handle) {
     }
 
     if (!handle->base_metadata) {
+#ifdef METADATA_V2
+        // Map exactly what gralloc allocates and maps on import, so either
+        // side can unmap a mapping made by the other.
+        auto size = handleMetaDataSize(handle);
+        void *base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                          handle->fd_metadata, 0);
+        if (base == reinterpret_cast<void *>(MAP_FAILED)) {
+            ALOGE("%s: metadata mmap failed - handle:%p fd: %d err: %s",
+                  __func__, handle, handle->fd_metadata, strerror(errno));
+            return -1;
+        }
+        handle->base_metadata = (uintptr_t)base;
+        return 0;
+#else
         auto size = getMetaDataSize();
         void *base = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED,
                 handle->fd_metadata, 0);
@@ -271,15 +297,20 @@ static int validateAndMap(private_handle_t* handle) {
           }
           handle->base_metadata = (uintptr_t)new_base;
         }
+#endif
     }
     return 0;
 }
 
 static void unmapAndReset(private_handle_t *handle) {
     if (private_handle_t::validate(handle) == 0 && handle->base_metadata) {
+#ifdef METADATA_V2
+      auto size = handleMetaDataSize(handle);
+#else
       // If reservedSize is 0, the return value will be the same as getMetaDataSize
       auto metadata = reinterpret_cast<MetaData_t *>(handle->base_metadata);
       auto size = getMetaDataSizeWithReservedRegion(metadata->reservedSize);
+#endif
       munmap(reinterpret_cast<void *>(handle->base_metadata), size);
       handle->base_metadata = 0;
     }
